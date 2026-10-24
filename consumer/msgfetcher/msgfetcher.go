@@ -13,6 +13,21 @@ import (
 	"github.com/pkg/errors"
 )
 
+// offsetLastStable is the ListOffsets timestamp sentinel introduced in
+// Kafka 0.11.0 (KIP-98) that makes the broker return the last stable offset
+// (LSO) of a partition instead of the log end offset.
+const offsetLastStable int64 = -3
+
+// Span is a half-open interval of offsets [From, To) proven non-deliverable
+// by the wire protocol in read_committed mode: aborted transaction records
+// or transaction control batches. It is reported to the partition consumer
+// so that the commit frontier maintained in offsettrk can advance across
+// these offsets without waiting for business acknowledgements.
+type Span struct {
+	From int64
+	To   int64
+}
+
 // Factory provides API to spawn message fetcher that read messages from
 // topic partitions. It ensures that there is only one fetcher instance for a
 // particular topic partition at a time.
@@ -43,6 +58,13 @@ type T interface {
 	// Messages returns the read channel for the messages that are fetched from
 	// the topic partition.
 	Messages() <-chan consumer.Message
+
+	// FilteredRanges returns a channel of offset intervals that are proven
+	// non-deliverable in read_committed mode (aborted transaction records and
+	// transaction control batches). The partition consumer uses them to
+	// advance its commit frontier. In read_uncommitted mode nothing is ever
+	// sent to this channel. The channel is closed when the fetcher stops.
+	FilteredRanges() <-chan Span
 
 	// Stop synchronously stops the partition consumer. It must be called
 	// before the factory that created the instance can be stopped.
@@ -111,8 +133,15 @@ func (f *factory) Spawn(parentActDesc *actor.Descriptor, topic string, partition
 		id:           id,
 		assignmentCh: make(chan mapper.Executor, 1),
 		messagesCh:   make(chan consumer.Message, f.cfg.Consumer.ChannelBufferSize),
+		filteredCh:   make(chan Span, f.cfg.Consumer.ChannelBufferSize),
 		stopCh:       make(chan none.T, 1),
 		offset:       realOffset,
+	}
+	if f.cfg.Consumer.Isolation == config.ReadCommittedIsolation {
+		// The transaction filter state is per fetcher instance, hence it is
+		// rebuilt from scratch after leader switches or fetcher restarts by
+		// re-scanning Fetch responses starting from the committed checkpoint.
+		mf.filter = newTxnFilter(actDesc)
 	}
 	if testReportErrors {
 		mf.errorsCh = make(chan error, f.cfg.Consumer.ChannelBufferSize)
@@ -153,18 +182,27 @@ func (f *factory) SpawnExecutor(brokerConn *sarama.Broker) mapper.Executor {
 
 // chooseStartingOffset returns a real offset value selected based on the
 // suggested offset. The real offset value is selected as follows:
-//  * if the suggested offset equals to sarama.OffsetOldest or it is smaller
-//    then the oldest partition offset, then the oldest partition offset is
-//    selected;
-//  * if the suggested offset equals to sarama.OffsetNewest, or it is larger
-//    then the newest partition offset, then the newest partition offset is
-//    selected.
+//   - if the suggested offset equals to sarama.OffsetOldest or it is smaller
+//     then the oldest partition offset, then the oldest partition offset is
+//     selected;
+//   - if the suggested offset equals to sarama.OffsetNewest, or it is larger
+//     then the newest partition offset, then the newest partition offset is
+//     selected.
+//
 // Note that by the time the fetcher starts reading, the offset can become
 // invalid, e.g. when the selected offset belongs to an expired segment. In
 // this case fetcher will terminate gracefully. The fetcher user can detect
 // that by closure of the fetcher message channel and act accordingly.
 func (f *factory) chooseStartingOffset(topic string, partition int32, offset int64) (int64, error) {
-	newestOffset, err := f.kafkaClt.GetOffset(topic, partition, sarama.OffsetNewest)
+	// In read_committed mode a consumer starting from the newest position
+	// must begin at the last stable offset rather than the physical log end,
+	// otherwise its position could jump over transactions that have not been
+	// completed yet (KIP-98, the ListOffsets LSO timestamp sentinel).
+	newestTime := int64(sarama.OffsetNewest)
+	if f.cfg.Consumer.Isolation == config.ReadCommittedIsolation {
+		newestTime = offsetLastStable
+	}
+	newestOffset, err := f.kafkaClt.GetOffset(topic, partition, newestTime)
 	if err != nil {
 		return 0, err
 	}
@@ -202,16 +240,26 @@ type msgFetcher struct {
 	offset                int64
 	assignmentCh          chan mapper.Executor
 	messagesCh            chan consumer.Message
+	filteredCh            chan Span
 	errorsCh              chan error
 	brokerRequestCh       chan<- fetchRq
 	nilOrBrokerRequestsCh chan<- fetchRq
 	stopCh                chan none.T
 	wg                    sync.WaitGroup
+
+	// filter keeps the cross-fetch transaction state. It is non-nil only in
+	// read_committed mode and it is rebuilt on every fetcher (re)spawn.
+	filter *txnFilter
 }
 
 // implements `Factory`.
 func (mf *msgFetcher) Messages() <-chan consumer.Message {
 	return mf.messagesCh
+}
+
+// implements `Factory`.
+func (mf *msgFetcher) FilteredRanges() <-chan Span {
+	return mf.filteredCh
 }
 
 // implements `Factory`.
@@ -229,8 +277,19 @@ func (mf *msgFetcher) Assignment() chan<- mapper.Executor {
 // redispatch goroutine; parses broker fetch responses and pushes parsed
 // `ConsumerMessages` to the message channel. It tries to keep the message
 // channel buffer full making fetch requests to the assigned broker as needed.
+// streamItem is either a business message fetched from Kafka or an offset
+// interval proven non-deliverable (filtered). Both kinds advance the internal
+// fetch scan cursor as they are handed over to the partition consumer; only
+// business messages advance the acknowledgement/commit frontier downstream.
+type streamItem struct {
+	msg    consumer.Message
+	span   Span
+	isSpan bool
+}
+
 func (mf *msgFetcher) run() {
 	defer close(mf.messagesCh)
+	defer close(mf.filteredCh)
 	if mf.errorsCh != nil {
 		defer close(mf.errorsCh)
 	}
@@ -242,11 +301,21 @@ func (mf *msgFetcher) run() {
 		fetchResultCh       = make(chan fetchRs, 1)
 		nilOrFetchResultsCh <-chan fetchRs
 		nilOrMessagesCh     chan<- consumer.Message
-		fetchedMessages     []consumer.Message
+		nilOrFilteredCh     chan<- Span
+		items               []streamItem
 		err                 error
-		currMessage         consumer.Message
-		currMessageIdx      int
+		currItem            streamItem
+		currItemIdx         int
 	)
+	// enableSend arms the channel that the current stream item should be
+	// pushed to.
+	enableSend := func() {
+		if currItem.isSpan {
+			nilOrFilteredCh = mf.filteredCh
+		} else {
+			nilOrMessagesCh = mf.messagesCh
+		}
+	}
 	for {
 		select {
 		case bw := <-mf.assignmentCh:
@@ -256,7 +325,7 @@ func (mf *msgFetcher) run() {
 
 			// If there is a fetch request pending, then let it complete,
 			// otherwise trigger one.
-			if nilOrFetchResultsCh == nil && nilOrMessagesCh == nil {
+			if nilOrFetchResultsCh == nil && nilOrMessagesCh == nil && nilOrFilteredCh == nil {
 				mf.nilOrBrokerRequestsCh = mf.brokerRequestCh
 			}
 
@@ -266,7 +335,7 @@ func (mf *msgFetcher) run() {
 
 		case fetchRs := <-nilOrFetchResultsCh:
 			nilOrFetchResultsCh = nil
-			if fetchedMessages, err = mf.parseFetchResponse(fetchRs); err != nil {
+			if items, err = mf.parseFetchResponse(fetchRs); err != nil {
 				mf.reportError(err)
 				if err == sarama.ErrOffsetOutOfRange {
 					mf.actDesc.Log().WithError(err).Error("Fatal request failure")
@@ -279,25 +348,51 @@ func (mf *msgFetcher) run() {
 				mf.f.mapper.TriggerReassign(mf)
 				continue
 			}
-			// If no messages has been fetched, then trigger another request.
-			if len(fetchedMessages) == 0 {
+			// If no items have been fetched (an empty response, or a response
+			// that contained only filtered records), then keep scanning with
+			// another request.
+			if len(items) == 0 {
 				mf.nilOrBrokerRequestsCh = mf.brokerRequestCh
 				continue
 			}
-			// Some messages have been fetched, start pushing them to the user.
-			currMessageIdx = 0
-			currMessage = fetchedMessages[currMessageIdx]
-			nilOrMessagesCh = mf.messagesCh
+			// Start pushing parsed items (both messages and filtered ranges)
+			// to the partition consumer.
+			currItemIdx = 0
+			currItem = items[currItemIdx]
+			nilOrMessagesCh, nilOrFilteredCh = nil, nil
+			enableSend()
 
-		case nilOrMessagesCh <- currMessage:
-			mf.offset = currMessage.Offset + 1
-			currMessageIdx++
-			if currMessageIdx < len(fetchedMessages) {
-				currMessage = fetchedMessages[currMessageIdx]
+		case nilOrMessagesCh <- currItem.msg:
+			// A business message handed over advances only the internal scan
+			// cursor; the commit frontier moves when the client acknowledges.
+			mf.offset = currItem.msg.Offset + 1
+			currItemIdx++
+			if currItemIdx < len(items) {
+				currItem = items[currItemIdx]
+				nilOrMessagesCh = nil
+				enableSend()
 				continue
 			}
-			// All messages have been pushed, trigger a new fetch request.
-			nilOrMessagesCh = nil
+			// All items have been pushed, trigger a new fetch request.
+			nilOrMessagesCh, nilOrFilteredCh = nil, nil
+			mf.nilOrBrokerRequestsCh = mf.brokerRequestCh
+
+		case nilOrFilteredCh <- currItem.span:
+			// A proven non-deliverable interval advances the scan cursor, but
+			// the partition consumer still needs an acknowledgement of the
+			// preceding business messages to move the commit frontier.
+			if currItem.span.To > mf.offset {
+				mf.offset = currItem.span.To
+			}
+			currItemIdx++
+			if currItemIdx < len(items) {
+				currItem = items[currItemIdx]
+				nilOrFilteredCh = nil
+				enableSend()
+				continue
+			}
+			// All items have been pushed, trigger a new fetch request.
+			nilOrMessagesCh, nilOrFilteredCh = nil, nil
 			mf.nilOrBrokerRequestsCh = mf.brokerRequestCh
 
 		case <-mf.stopCh:
@@ -306,8 +401,11 @@ func (mf *msgFetcher) run() {
 	}
 }
 
-// parseFetchResponse parses a fetch response received a broker.
-func (mf *msgFetcher) parseFetchResponse(fetchRs fetchRs) ([]consumer.Message, error) {
+// parseFetchResponse parses a fetch response received from a broker. In
+// read_committed mode it drives the transaction filter, so the returned
+// stream interleaves business messages with non-deliverable offset spans in
+// strict offset order.
+func (mf *msgFetcher) parseFetchResponse(fetchRs fetchRs) ([]streamItem, error) {
 	if fetchRs.connErr != nil {
 		return nil, fetchRs.connErr
 	}
@@ -323,20 +421,40 @@ func (mf *msgFetcher) parseFetchResponse(fetchRs fetchRs) ([]consumer.Message, e
 		return nil, fetchRsBlock.Err
 	}
 
+	if mf.filter != nil {
+		mf.filter.beginBlock(fetchRsBlock)
+	}
+
 	highWaterMarkOffset := fetchRsBlock.HighWaterMarkOffset
-	var fetchedMessages []consumer.Message
+	var items []streamItem
 	for _, recordsSet := range fetchRsBlock.RecordsSet {
-		recordBatch := recordsSet.RecordBatch
-		if recordBatch != nil {
-			fetchedMessages = append(fetchedMessages, mf.parseRecordBatch(recordBatch, highWaterMarkOffset)...)
+		if recordBatch := recordsSet.RecordBatch; recordBatch != nil {
+			if mf.filter != nil {
+				visible, span := mf.filter.classifyBatch(recordBatch)
+				if !visible {
+					// A span entirely behind the scan cursor cannot advance
+					// anything, so there is no point in reporting it.
+					if span.To > mf.offset {
+						items = append(items, streamItem{span: span, isSpan: true})
+					}
+					continue
+				}
+			} else if recordBatch.Control {
+				mf.actDesc.Log().Warn("Control record batch ignored")
+				continue
+			}
+			for _, consumerMsg := range mf.parseRecordBatch(recordBatch, highWaterMarkOffset) {
+				items = append(items, streamItem{msg: consumerMsg})
+			}
 			continue
 		}
-		messageSet := recordsSet.MsgSet
-		if messageSet != nil {
-			fetchedMessages = append(fetchedMessages, mf.parseMessageSet(messageSet, highWaterMarkOffset)...)
+		if messageSet := recordsSet.MsgSet; messageSet != nil {
+			for _, consumerMsg := range mf.parseMessageSet(messageSet, highWaterMarkOffset) {
+				items = append(items, streamItem{msg: consumerMsg})
+			}
 		}
 	}
-	return fetchedMessages, nil
+	return items, nil
 }
 
 func (mf *msgFetcher) parseMessageSet(messageSet *sarama.MessageSet, highWaterMarkOffset int64) []consumer.Message {
@@ -523,7 +641,7 @@ func (be *brokerExecutor) runExecutor() {
 		}
 		if be.cfg.Kafka.Version.IsAtLeast(sarama.V0_11_0_0) {
 			kafkaFetchRq.Version = 4
-			kafkaFetchRq.Isolation = sarama.ReadUncommitted
+			kafkaFetchRq.Isolation = be.cfg.Consumer.Isolation.ToSarama()
 		}
 
 		for _, fr := range requestBatch {

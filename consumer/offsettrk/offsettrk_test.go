@@ -405,3 +405,92 @@ func (s *OffsetTrkSuite) TestMaxOfferTimeout(c *C) {
 func msg(offset int64) consumer.Message {
 	return consumer.Message{ConsumerMessage: sarama.ConsumerMessage{Offset: offset}}
 }
+
+// Offset intervals proven non-deliverable by the transaction protocol
+// advance the commit frontier without business acknowledgements.
+func (s *OffsetTrkSuite) TestOnFilteredAdvance(c *C) {
+	ot := New(s.ns, offsetmgr.Offset{Val: 300}, -1)
+
+	// A filtered interval adjacent to the frontier advances it.
+	offset, _ := ot.OnFiltered(300, 305)
+	c.Assert(offset.Val, Equals, int64(305))
+	c.Assert(SparseAcks2Str(offset), Equals, "")
+
+	// Adjacent and overlapping calls keep advancing and merge.
+	offset, _ = ot.OnFiltered(305, 308)
+	c.Assert(offset.Val, Equals, int64(308))
+	offset, _ = ot.OnFiltered(306, 310)
+	c.Assert(offset.Val, Equals, int64(310))
+	c.Assert(SparseAcks2Str(offset), Equals, "")
+
+	// Empty intervals and intervals behind the frontier are no-ops.
+	offset, _ = ot.OnFiltered(310, 310)
+	c.Assert(offset.Val, Equals, int64(310))
+	offset, _ = ot.OnFiltered(290, 300)
+	c.Assert(offset.Val, Equals, int64(310))
+
+	// The state survives sparse-ack metadata encoding.
+	ot2 := New(s.ns, offset, -1)
+	c.Assert(ot2.ackedRanges, IsNil)
+}
+
+// The commit frontier must not jump over an unacknowledged business message
+// when filtered intervals are reported out of order.
+func (s *OffsetTrkSuite) TestOnFilteredOutOfOrder(c *C) {
+	ot := New(s.ns, offsetmgr.Offset{Val: 300}, -1)
+
+	// A filtered interval ahead of the frontier is parked in sparse ranges.
+	offset, _ := ot.OnFiltered(305, 308)
+	c.Assert(offset.Val, Equals, int64(300))
+	c.Assert(SparseAcks2Str(offset), Equals, "5-8")
+
+	// Filling the gap up to, but not including, offset 303 parks again.
+	offset, _ = ot.OnFiltered(300, 303)
+	c.Assert(offset.Val, Equals, int64(303))
+	c.Assert(SparseAcks2Str(offset), Equals, "2-5")
+
+	// Closing the remaining gap advances the frontier through the span.
+	offset, _ = ot.OnFiltered(303, 305)
+	c.Assert(offset.Val, Equals, int64(308))
+	c.Assert(SparseAcks2Str(offset), Equals, "")
+
+	// The state survives sparse-ack metadata encoding.
+	ot2 := New(s.ns, offset, -1)
+	c.Assert(ot2.ackedRanges, IsNil)
+}
+
+// A filtered interval must never pass over an offered but unacknowledged
+// business message that precedes or lies inside it.
+func (s *OffsetTrkSuite) TestOnFilteredAroundOffers(c *C) {
+	ot := New(s.ns, offsetmgr.Offset{Val: 300}, -1)
+
+	// Message 300 is offered but not acknowledged yet. A filtered span right
+	// after it is parked in sparse ranges and the frontier stays put.
+	c.Assert(ot.OnOffered(msg(300)), Equals, 1)
+	offset, offered := ot.OnFiltered(301, 304)
+	c.Assert(offered, Equals, 1)
+	c.Assert(offset.Val, Equals, int64(300))
+	c.Assert(SparseAcks2Str(offset), Equals, "1-4")
+
+	// Acking the blocking message drains the parked span.
+	offset, offered = ot.OnAcked(300)
+	c.Assert(offered, Equals, 0)
+	c.Assert(offset.Val, Equals, int64(304))
+	c.Assert(SparseAcks2Str(offset), Equals, "")
+
+	// An offer strictly inside a span splits the span around it. The part up
+	// to the offer is committed, the message itself still blocks the rest.
+	c.Assert(ot.OnOffered(msg(306)), Equals, 1)
+	offset, offered = ot.OnFiltered(304, 310)
+	c.Assert(offered, Equals, 1)
+	c.Assert(offset.Val, Equals, int64(306))
+	c.Assert(SparseAcks2Str(offset), Equals, "1-4")
+
+	// Older pending offers before the span do not corrupt its boundary.
+	ot3 := New(s.ns, offsetmgr.Offset{Val: 400}, -1)
+	c.Assert(ot3.OnOffered(msg(400)), Equals, 1)
+	offset, offered = ot3.OnFiltered(402, 405)
+	c.Assert(offered, Equals, 1)
+	c.Assert(offset.Val, Equals, int64(400))
+	c.Assert(SparseAcks2Str(offset), Equals, "2-5")
+}

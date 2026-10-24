@@ -156,6 +156,79 @@ func (s *ConfigSuite) TestFromYAMLKafkaTLS(c *C) {
 	c.Assert(kafkaCfg.InsecureSkipVerify, Equals, false)
 }
 
+// The consumer isolation level is parsed from YAML, defaults to
+// read_uncommitted and maps onto the corresponding sarama value.
+func (s *ConfigSuite) TestIsolationFromYAML(c *C) {
+	base := func(isolation string) []byte {
+		return []byte("" +
+			"proxies:\n" +
+			"  default:\n" +
+			"    kafka:\n" +
+			"      seed_peers:\n" +
+			"        - 192.168.19.2:9092\n" +
+			"      version: 0.11.0.0\n" +
+			"    consumer:\n" +
+			"      isolation: " + isolation + "\n")
+	}
+
+	// Explicit read_committed on a 0.11 cluster is accepted.
+	appCfg, err := FromYAML(base("read_committed"))
+	c.Assert(err, IsNil)
+	p := appCfg.Proxies["default"]
+	c.Assert(p.Consumer.Isolation, Equals, ReadCommittedIsolation)
+	c.Assert(p.Consumer.Isolation.ToSarama(), Equals, sarama.ReadCommitted)
+
+	// Explicit read_uncommitted is accepted too.
+	appCfg, err = FromYAML(base("read_uncommitted"))
+	c.Assert(err, IsNil)
+	c.Assert(appCfg.Proxies["default"].Consumer.Isolation, Equals, ReadUncommittedIsolation)
+
+	// Omitting the setting keeps the default.
+	appCfg, err = FromYAML([]byte("" +
+		"proxies:\n" +
+		"  default:\n" +
+		"    kafka:\n" +
+		"      seed_peers:\n" +
+		"        - 192.168.19.2:9092\n" +
+		"      version: 0.11.0.0\n"))
+	c.Assert(err, IsNil)
+	c.Assert(appCfg.Proxies["default"].Consumer.Isolation, Equals, ReadUncommittedIsolation)
+	c.Assert(appCfg.Proxies["default"].Consumer.Isolation.ToSarama(), Equals, sarama.ReadUncommitted)
+}
+
+// read_committed isolation is rejected at startup on Kafka versions older
+// than 0.11.0.0 with an explicit error.
+func (s *ConfigSuite) TestIsolationVersionValidation(c *C) {
+	data := []byte("" +
+		"proxies:\n" +
+		"  default:\n" +
+		"    kafka:\n" +
+		"      seed_peers:\n" +
+		"        - 192.168.19.2:9092\n" +
+		"      version: 0.10.2.1\n" +
+		"    consumer:\n" +
+		"      isolation: read_committed\n")
+
+	_, err := FromYAML(data)
+	c.Assert(err, ErrorMatches, ".*consumer.isolation=read_committed requires kafka.version >= 0.11.0.0")
+}
+
+// An unknown isolation value is rejected while parsing the YAML.
+func (s *ConfigSuite) TestIsolationBadValue(c *C) {
+	data := []byte("" +
+		"proxies:\n" +
+		"  default:\n" +
+		"    kafka:\n" +
+		"      seed_peers:\n" +
+		"        - 192.168.19.2:9092\n" +
+		"      version: 0.11.0.0\n" +
+		"    consumer:\n" +
+		"      isolation: read_skew\n")
+
+	_, err := FromYAML(data)
+	c.Assert(err, ErrorMatches, ".*bad consumer isolation level, read_skew")
+}
+
 func (s *ConfigSuite) TestClientIDFromNomad(c *C) {
 	// When
 	os.Setenv("NOMAD_ALLOC_ID", "b313e983-c906-49df-b5f7-f6fbc59b3297")

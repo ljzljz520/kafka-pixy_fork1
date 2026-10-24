@@ -259,7 +259,50 @@ type Proxy struct {
 		// Period of time that Kafka-Pixy should keep subscription to
 		// a topic by a group in absence of requests from the consumer group.
 		SubscriptionTimeout time.Duration `yaml:"subscription_timeout"`
+
+		// Transaction isolation level used while fetching messages from
+		// Kafka. The default `read_uncommitted` makes all records visible,
+		// including records of ongoing and aborted transactions. When set to
+		// `read_committed` only records of committed transactions (along
+		// with non-transactional records) are delivered to clients; aborted
+		// transaction records and transaction control batches are filtered
+		// out internally. The latter requires Kafka 0.11.0.0 or newer.
+		Isolation IsolationLevel `yaml:"isolation"`
 	} `yaml:"consumer"`
+}
+
+// IsolationLevel defines the transaction isolation level used by consumers.
+type IsolationLevel int8
+
+const (
+	// ReadUncommittedIsolation is the default isolation level: all messages
+	// are returned regardless of the transaction state of their producer.
+	ReadUncommittedIsolation IsolationLevel = iota
+
+	// ReadCommittedIsolation makes consumers see only records of committed
+	// transactions (and non-transactional records).
+	ReadCommittedIsolation
+)
+
+// ToSarama converts the isolation level into the sarama representation used
+// in Fetch requests.
+func (il IsolationLevel) ToSarama() sarama.IsolationLevel {
+	if il == ReadCommittedIsolation {
+		return sarama.ReadCommitted
+	}
+	return sarama.ReadUncommitted
+}
+
+func (il *IsolationLevel) UnmarshalText(text []byte) error {
+	switch string(text) {
+	case "read_uncommitted":
+		*il = ReadUncommittedIsolation
+	case "read_committed":
+		*il = ReadCommittedIsolation
+	default:
+		return errors.Errorf("bad consumer isolation level, %s", string(text))
+	}
+	return nil
 }
 
 type KafkaVersion struct {
@@ -586,6 +629,17 @@ func (p *Proxy) validate() error {
 	case p.Consumer.RetryBackoff <= 0:
 		return errors.New("consumer.retry_backoff must be > 0")
 	}
+	switch p.Consumer.Isolation {
+	case ReadUncommittedIsolation, ReadCommittedIsolation:
+	default:
+		return errors.New("consumer.isolation must be either read_uncommitted or read_committed")
+	}
+	// Transaction isolation (Fetch API v4) and the last stable offset query
+	// were introduced in Kafka 0.11.0.0.
+	if p.Consumer.Isolation == ReadCommittedIsolation &&
+		!p.Kafka.Version.IsAtLeast(sarama.V0_11_0_0) {
+		return errors.New("consumer.isolation=read_committed requires kafka.version >= 0.11.0.0")
+	}
 
 	// Validate TLS configuration.
 	if err := p.validateTLS(); err != nil {
@@ -681,6 +735,7 @@ func defaultProxyWithClientID(clientID string) *Proxy {
 	c.Consumer.OffsetsCommitInterval = 500 * time.Millisecond
 	c.Consumer.SubscriptionTimeout = 15 * time.Second
 	c.Consumer.RetryBackoff = 500 * time.Millisecond
+	c.Consumer.Isolation = ReadUncommittedIsolation
 	return c
 }
 

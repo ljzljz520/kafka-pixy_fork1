@@ -168,11 +168,12 @@ func (pc *T) runFetchLoop() bool {
 			offsetRepr(pc.submittedOffset), offsetRepr(pc.committedOffset))
 	}
 	var (
-		nilOrMsgInCh  = mf.Messages()
-		nilOrMsgOutCh chan consumer.Message
-		retryTicker   = time.NewTicker(check4RetryInterval)
-		msg           consumer.Message
-		msgOk         bool
+		nilOrMsgInCh      = mf.Messages()
+		nilOrFilteredInCh = mf.FilteredRanges()
+		nilOrMsgOutCh     chan consumer.Message
+		retryTicker       = time.NewTicker(check4RetryInterval)
+		msg               consumer.Message
+		msgOk             bool
 	)
 	defer retryTicker.Stop()
 	for {
@@ -193,6 +194,22 @@ func (pc *T) runFetchLoop() bool {
 			nilOrMsgOutCh = pc.messagesCh
 			// Stop fetching messages until this one is offered to a client.
 			nilOrMsgInCh = nil
+
+		case span, spanOk := <-nilOrFilteredInCh:
+			// The channel is closed together with the message channel when
+			// the fetcher stops; closure of the message channel below drives
+			// the fetch loop restart.
+			if !spanOk {
+				nilOrFilteredInCh = nil
+				continue
+			}
+			// Offsets proven non-deliverable by the transaction protocol
+			// advance the commit frontier independently of business
+			// acknowledgement, but never across unacknowledged messages that
+			// precede them.
+			pc.submittedOffset, offerCount = pc.offsetTrk.OnFiltered(span.From, span.To)
+			atomic.StoreInt32(&pc.offerCount, int32(offerCount))
+			pc.offsetMgr.SubmitOffset(pc.submittedOffset)
 
 		case <-retryTicker.C:
 			if msgOk {

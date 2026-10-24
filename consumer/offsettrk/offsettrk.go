@@ -136,6 +136,88 @@ func (ot *T) OnAcked(offset int64) (offsetmgr.Offset, int) {
 	return ot.offset, len(ot.offers)
 }
 
+// OnFiltered marks the half-open [from, to) offset interval as proven
+// non-deliverable by the wire protocol, that is aborted transaction records
+// or transaction control batches observed in read_committed mode. Such
+// offsets are never offered to business clients. They are tracked together
+// with sparse acknowledgements so that the commit frontier can advance
+// across them, but it can never jump over a business message that precedes
+// the interval and has not been acknowledged yet. It returns the offset to
+// be submitted and the current number of offered messages.
+func (ot *T) OnFiltered(from, to int64) (offsetmgr.Offset, int) {
+	if to <= from || to <= ot.offset.Val {
+		return ot.offset, len(ot.offers)
+	}
+	if from < ot.offset.Val {
+		from = ot.offset.Val
+	}
+	// Defensive split around currently offered offsets. A filtered record is
+	// never offered, therefore this loop is normally a no-op, but keeping the
+	// invariant here guarantees that the commit frontier cannot be moved
+	// past an unacknowledged business message under any circumstances.
+	for _, o := range ot.offers {
+		if o.offset >= to {
+			break
+		}
+		if o.offset < from {
+			// An older unacknowledged offer precedes the interval, it must
+			// not influence its lower boundary.
+			continue
+		}
+		if o.offset > from {
+			ot.mergeAckedRange(from, o.offset)
+		}
+		from = o.offset + 1
+	}
+	if from < to {
+		ot.mergeAckedRange(from, to)
+	}
+	// Advance the frontier across every resolved range adjacent to it.
+	for len(ot.ackedRanges) > 0 && ot.ackedRanges[0].from == ot.offset.Val {
+		ot.offset.Val = ot.ackedRanges[0].to
+		ot.ackedRanges = ot.ackedRanges[1:]
+	}
+	ot.offset.Meta = encodeAckedRanges(ot.offset.Val, ot.ackedRanges)
+	return ot.offset, len(ot.offers)
+}
+
+// mergeAckedRange inserts the half-open interval [from, to) into the sorted
+// disjoint list of resolved offset ranges merging overlapping and adjacent
+// entries along the way.
+func (ot *T) mergeAckedRange(from, to int64) {
+	if to <= from {
+		return
+	}
+	i := sort.Search(len(ot.ackedRanges), func(i int) bool {
+		return ot.ackedRanges[i].to >= from
+	})
+	j := i
+	for j < len(ot.ackedRanges) && ot.ackedRanges[j].from <= to {
+		if ot.ackedRanges[j].from < from {
+			from = ot.ackedRanges[j].from
+		}
+		if ot.ackedRanges[j].to > to {
+			to = ot.ackedRanges[j].to
+		}
+		j++
+	}
+	if j == i {
+		ot.ackedRanges = append(ot.ackedRanges, offsetRange{})
+		copy(ot.ackedRanges[i+1:], ot.ackedRanges[i:])
+		ot.ackedRanges[i] = offsetRange{from: from, to: to}
+		return
+	}
+	ot.ackedRanges[i] = offsetRange{from: from, to: to}
+	drop := j - i - 1
+	if drop > 0 {
+		copy(ot.ackedRanges[i+1:], ot.ackedRanges[j:])
+		for k := len(ot.ackedRanges) - drop; k < len(ot.ackedRanges); k++ {
+			ot.ackedRanges[k] = offsetRange{}
+		}
+		ot.ackedRanges = ot.ackedRanges[:len(ot.ackedRanges)-drop]
+	}
+}
+
 // IsAcked checks if an offset has already been acknowledged. The second
 // returned value is the smallest not acked offset that is greater than the
 // specified offset.

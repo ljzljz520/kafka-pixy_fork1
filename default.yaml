@@ -192,6 +192,17 @@ proxies:
       # topic by a group in absence of requests to from the consumer group.
       subscription_timeout: 15s
 
+      # Transaction isolation level used when fetching messages. Allowed
+      # values are:
+      #  * read_uncommitted: (default) all records are delivered, including
+      #                      records of ongoing and aborted transactions.
+      #  * read_committed:  only records of committed transactions (and
+      #                      non-transactional records) are delivered; aborted
+      #                      transaction records and transaction control
+      #                      batches are skipped internally. Requires Kafka
+      #                      0.11.0.0 or newer (see `kafka.version` above).
+      isolation: read_uncommitted
+
 # Configuration for securely accessing the gRPC and web servers
 tls:
 
